@@ -1,0 +1,26 @@
+# Environment variables
+.env
+
+# Log files
+logs/
+*.log
+
+# Goland
+.idea/
+*.iml
+*.iws
+*.ipr
+
+
+/monitor
+/solana-monitor
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.swp
+*.swo 
