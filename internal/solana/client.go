@@ -7,59 +7,66 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"solana-monitor/internal/logging"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"golang.org/x/time/rate"
 )
 
 // USDC token mint address on Solana mainnet
 const (
-	USDCMint     = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-	USDCDecimals = 6
+	USDCMint       = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+	USDCDecimals   = 6
+	initialBackoff = 5 * time.Second
+	maxBackoff     = 2 * time.Minute
+
+	// Rate limiting constants
+	rateLimit   = 10                     // requests per second
+	burstLimit  = 15                     // burst capacity
+	minWaitTime = 100 * time.Millisecond // minimum wait between requests
 )
 
-// Client represents a Solana RPC client
+// Client represents a Solana RPC client with rate limiting
 type Client struct {
-	rpcClient *rpc.Client
-	endpoint  string
-	logger    *log.Logger
+	rpcClient    *rpc.Client
+	endpoint     string
+	logger       *log.Logger
+	backoff      time.Duration
+	rateLimiter  *rate.Limiter
+	lastRequest  time.Time
+	lastReqMutex sync.Mutex
 }
 
-// NewClient creates a new Solana client
+// NewClient creates a new Solana client with rate limiting
 func NewClient(endpoint string) (*Client, error) {
-	// Create a logger that writes to both file and console
-	logFile, err := logging.CreateLogFile("solana_rpc.log")
+	logFile, err := logging.CreateLogFile("solana-rpc.log")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create log file: %v", err)
 	}
 
-	// Create a multi-writer that writes to both file and console
-	multiWriter := logging.CreateMultiWriter(logFile)
-	logger := log.New(multiWriter, "[SOLANA-RPC] ", log.LstdFlags|log.Lmicroseconds)
-
+	logger := log.New(logging.CreateMultiWriter(logFile), "[SOLANA-RPC] ", log.LstdFlags|log.Lmicroseconds)
 	logger.Printf("Initializing Solana RPC client with endpoint: %s", endpoint)
 
-	rpcClient := rpc.New(endpoint)
+	client := rpc.New(endpoint)
 
-	// Test the connection
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
+	// Test connection
 	logger.Printf("Testing RPC connection...")
-	slot, err := rpcClient.GetSlot(ctx, rpc.CommitmentFinalized)
+	slot, err := client.GetSlot(context.Background(), rpc.CommitmentFinalized)
 	if err != nil {
-		logger.Printf("[ERROR] RPC connection test failed: %v", err)
 		return nil, fmt.Errorf("failed to connect to RPC endpoint: %v", err)
 	}
 	logger.Printf("[SUCCESS] RPC connection successful! Current slot: %d", slot)
 
 	return &Client{
-		rpcClient: rpcClient,
-		endpoint:  endpoint,
-		logger:    logger,
+		rpcClient:   client,
+		logger:      logger,
+		backoff:     initialBackoff,
+		rateLimiter: rate.NewLimiter(rate.Limit(rateLimit), burstLimit),
+		lastRequest: time.Now(),
 	}, nil
 }
 
@@ -72,158 +79,141 @@ type Transaction struct {
 	ToAddr     string
 }
 
-// getRateLimitDelay extracts the retry delay from an RPC error
-func (c *Client) getRateLimitDelay(err error) time.Duration {
-	// Try to convert to jsonrpc.RPCError
-	if errStr := err.Error(); strings.Contains(errStr, "jsonrpc.RPCError") {
-		if strings.Contains(errStr, "Too many requests") {
-			// For rate limit errors (429), use a progressive backoff starting at 5 seconds
-			return 5 * time.Second
-		}
+// waitForRateLimit waits for rate limit token and enforces minimum wait time
+func (c *Client) waitForRateLimit(ctx context.Context) error {
+	c.lastReqMutex.Lock()
+	timeSinceLastReq := time.Since(c.lastRequest)
+	if timeSinceLastReq < minWaitTime {
+		time.Sleep(minWaitTime - timeSinceLastReq)
 	}
-	return 0
+	c.lastReqMutex.Unlock()
+
+	if err := c.rateLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limiter wait failed: %v", err)
+	}
+
+	c.lastReqMutex.Lock()
+	c.lastRequest = time.Now()
+	c.lastReqMutex.Unlock()
+	return nil
+}
+
+// ptr returns a pointer to the provided uint64 value
+func ptr(v uint64) *uint64 {
+	return &v
 }
 
 // MonitorTransactions monitors USDC transactions for specific addresses
 func (c *Client) MonitorTransactions(ctx context.Context, addresses []string, threshold float64) (<-chan Transaction, error) {
-	txChan := make(chan Transaction)
 	c.logger.Printf("Starting transaction monitoring for addresses: %v (threshold: %.2f USDC)", addresses, threshold)
 
-	// Convert addresses to pubkeys
-	var pubkeys []solana.PublicKey
+	// Validate addresses
 	for _, addr := range addresses {
-		pubkey, err := solana.PublicKeyFromBase58(addr)
-		if err != nil {
-			c.logger.Printf("[ERROR] Invalid address %s: %v", addr, err)
+		if err := c.validateAddress(addr); err != nil {
 			return nil, fmt.Errorf("invalid address %s: %v", addr, err)
 		}
-		pubkeys = append(pubkeys, pubkey)
 		c.logger.Printf("[SUCCESS] Successfully validated address: %s", addr)
 	}
 
-	// Start monitoring in a goroutine
+	txChan := make(chan Transaction)
+
 	go func() {
 		defer close(txChan)
 		c.logger.Printf("Starting transaction monitoring goroutine")
 
-		lastSignatures := make(map[solana.PublicKey]string)
-		errorCount := 0
-		baseDelay := 5 * time.Second // Increased base delay
-		maxDelay := 2 * time.Minute
-		rateLimitCount := 0
-		maxRateLimitDelay := 30 * time.Second
-
-		for {
+		for _, address := range addresses {
 			select {
 			case <-ctx.Done():
-				c.logger.Printf("Stopping transaction monitoring (context cancelled)")
+				c.logger.Printf("Context canceled, stopping transaction monitoring for %s", address)
 				return
 			default:
-				for _, pubkey := range pubkeys {
-					// Create a timeout context for each RPC call
-					rpcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-
-					c.logger.Printf("Fetching signatures for address: %s", pubkey.String())
-					sigs, err := c.rpcClient.GetSignaturesForAddress(rpcCtx, pubkey)
-					cancel()
-
-					if err != nil {
-						// Check for rate limit error first
-						if rateLimitDelay := c.getRateLimitDelay(err); rateLimitDelay > 0 {
-							rateLimitCount++
-							// Progressive backoff for rate limits
-							actualDelay := time.Duration(math.Min(
-								float64(rateLimitDelay)*math.Pow(1.5, float64(rateLimitCount-1)),
-								float64(maxRateLimitDelay),
-							))
-							c.logger.Printf("🚫 Rate limited: waiting for %v (attempt %d)", actualDelay, rateLimitCount)
-							time.Sleep(actualDelay)
-							continue
-						}
-
-						// If not rate limited, use exponential backoff
-						errorCount++
-						delay := time.Duration(math.Min(float64(baseDelay)*math.Pow(2, float64(errorCount-1)), float64(maxDelay)))
-						c.logger.Printf("[ERROR] Failed to get signatures for %s: %v (error count: %d, backing off for %v)",
-							pubkey.String(), err, errorCount, delay)
-						time.Sleep(delay)
-						continue
-					}
-					errorCount = 0     // Reset error count on success
-					rateLimitCount = 0 // Reset rate limit count on success
-
-					// Process new signatures
-					for _, sig := range sigs {
-						if lastSignatures[pubkey] == sig.Signature.String() {
-							continue // Skip already processed transactions
-						}
-
-						c.logger.Printf("Processing new transaction: %s", sig.Signature.String())
-
-						// Get transaction with parsed data
-						rpcCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
-						maxVersion := uint64(0)
-						opts := &rpc.GetTransactionOpts{
-							Encoding:                       solana.EncodingBase64,
-							MaxSupportedTransactionVersion: &maxVersion,
-							Commitment:                     rpc.CommitmentConfirmed,
-						}
-
-						tx, err := c.rpcClient.GetTransaction(rpcCtx, sig.Signature, opts)
-						cancel()
-
-						if err != nil {
-							// Check for rate limit error first
-							if rateLimitDelay := c.getRateLimitDelay(err); rateLimitDelay > 0 {
-								rateLimitCount++
-								// Progressive backoff for rate limits
-								actualDelay := time.Duration(math.Min(
-									float64(rateLimitDelay)*math.Pow(1.5, float64(rateLimitCount-1)),
-									float64(maxRateLimitDelay),
-								))
-								c.logger.Printf("🚫 Rate limited: waiting for %v (attempt %d)", actualDelay, rateLimitCount)
-								time.Sleep(actualDelay)
-								continue
-							}
-
-							// If not rate limited, use exponential backoff
-							errorCount++
-							delay := time.Duration(math.Min(float64(baseDelay)*math.Pow(2, float64(errorCount-1)), float64(maxDelay)))
-							c.logger.Printf("[ERROR] Failed to get transaction %s: %v (backing off for %v)",
-								sig.Signature.String(), err, delay)
-							time.Sleep(delay)
-							continue
-						}
-						errorCount = 0     // Reset error count on success
-						rateLimitCount = 0 // Reset rate limit count on success
-
-						// Process transaction if it involves USDC
-						if amount := c.extractUSDCAmount(tx); amount >= threshold {
-							c.logger.Printf("💰 Found large USDC transfer: %.2f USDC in tx %s",
-								amount, sig.Signature.String())
-
-							// Extract addresses
-							fromAddr, toAddr := c.extractAddresses(tx)
-
-							txChan <- Transaction{
-								Signature:  sig.Signature.String(),
-								Timestamp:  time.Unix(int64(*tx.BlockTime), 0),
-								USDCAmount: amount,
-								FromAddr:   fromAddr,
-								ToAddr:     toAddr,
-							}
-						}
-
-						// Update last processed signature
-						lastSignatures[pubkey] = sig.Signature.String()
-
-						// Sleep between transaction requests to avoid rate limiting
-						time.Sleep(baseDelay)
-					}
+				if err := c.waitForRateLimit(ctx); err != nil {
+					c.logger.Printf("[ERROR] Rate limit wait failed: %v", err)
+					continue
 				}
 
-				// Sleep between address checks
-				time.Sleep(5 * time.Second)
+				c.logger.Printf("Fetching signatures for address: %s", address)
+				pubkey, _ := solana.PublicKeyFromBase58(address)
+				sigs, err := c.rpcClient.GetSignaturesForAddress(ctx, pubkey)
+				if err != nil {
+					if strings.Contains(err.Error(), "Too many requests") {
+						c.logger.Printf("[RATE LIMIT] Hit rate limit, backing off for %v", c.backoff)
+						time.Sleep(c.backoff)
+						c.backoff *= 2
+						if c.backoff > maxBackoff {
+							c.backoff = maxBackoff
+						}
+					}
+					c.logger.Printf("[ERROR] Failed to get signatures for %s: %v", address, err)
+					continue
+				}
+				c.backoff = initialBackoff // Reset backoff on success
+
+				for _, sig := range sigs {
+					select {
+					case <-ctx.Done():
+						c.logger.Printf("Context canceled, stopping transaction processing")
+						return
+					default:
+						if err := c.waitForRateLimit(ctx); err != nil {
+							c.logger.Printf("[ERROR] Rate limit wait failed: %v", err)
+							continue
+						}
+
+						c.logger.Printf("Processing new transaction: %s", sig.Signature)
+						opts := &rpc.GetTransactionOpts{
+							Encoding:                       solana.EncodingBase64,
+							Commitment:                     rpc.CommitmentConfirmed,
+							MaxSupportedTransactionVersion: ptr(0),
+						}
+						tx, err := c.rpcClient.GetTransaction(ctx, sig.Signature, opts)
+						if err != nil {
+							if ctx.Err() != nil {
+								c.logger.Printf("Context canceled while processing transaction %s", sig.Signature)
+								return
+							}
+							if strings.Contains(err.Error(), "Too many requests") {
+								c.logger.Printf("[RATE LIMIT] Hit rate limit, backing off for %v", c.backoff)
+								time.Sleep(c.backoff)
+								c.backoff *= 2
+								if c.backoff > maxBackoff {
+									c.backoff = maxBackoff
+								}
+								continue
+							}
+							// Skip transaction version errors as they are not critical
+							if strings.Contains(err.Error(), "Transaction version") {
+								c.logger.Printf("[WARN] Skipping unsupported transaction version for %s", sig.Signature)
+								continue
+							}
+							c.logger.Printf("[ERROR] Failed to get transaction %s: %v (backing off)", sig.Signature, err)
+							continue
+						}
+						c.backoff = initialBackoff // Reset backoff on success
+
+						// Skip if transaction is nil or has no metadata
+						if tx == nil || tx.Meta == nil {
+							c.logger.Printf("[WARN] Transaction %s has no metadata, skipping", sig.Signature)
+							continue
+						}
+
+						// Process transaction and send if it meets criteria
+						if amount := c.extractUSDCAmount(tx); amount >= threshold {
+							fromAddr, toAddr := c.extractAddresses(tx)
+							select {
+							case <-ctx.Done():
+								return
+							case txChan <- Transaction{
+								Signature:  sig.Signature.String(),
+								USDCAmount: amount,
+								Timestamp:  time.Unix(int64(*tx.BlockTime), 0),
+								FromAddr:   fromAddr,
+								ToAddr:     toAddr,
+							}:
+							}
+						}
+					}
+				}
 			}
 		}
 	}()
@@ -279,4 +269,9 @@ func (c *Client) extractUSDCAmount(tx *rpc.GetTransactionResult) float64 {
 	}
 
 	return 0
+}
+
+func (c *Client) validateAddress(address string) error {
+	_, err := solana.PublicKeyFromBase58(address)
+	return err
 }

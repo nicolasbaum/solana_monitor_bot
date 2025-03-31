@@ -3,6 +3,8 @@ package monitor
 import (
 	"context"
 	"log"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -11,67 +13,62 @@ import (
 	"solana-monitor/internal/solana"
 )
 
-// SolanaClientInterface defines the interface for the Solana client
 type SolanaClientInterface interface {
 	MonitorTransactions(ctx context.Context, addresses []string, threshold float64) (<-chan solana.Transaction, error)
 }
 
-// TelegramBotInterface defines the interface for the Telegram bot
 type TelegramBotInterface interface {
 	SendAlert(chatID int64, message string) error
 }
 
-// Service represents the monitoring service
 type Service struct {
 	solanaClient SolanaClientInterface
 	bot          TelegramBotInterface
 	config       *config.Config
-	addresses    map[int64][]string // Map of chat ID to monitored addresses
+	addresses    map[int64][]string
 	mu           sync.RWMutex
-	monitors     map[int64]context.CancelFunc // Map of chat ID to monitor cancel functions
+	monitors     map[int64]context.CancelFunc
 	logger       *log.Logger
-	rules        []Rule // List of rules to apply to transactions
+	rules        []Rule
 }
 
-// NewService creates a new monitoring service
-func NewService(solanaClient SolanaClientInterface, cfg *config.Config) *Service {
-	// Create service logger
-	logFile, err := logging.CreateLogFile("monitor_service.log")
+func NewService(solanaClient SolanaClientInterface, config *config.Config) *Service {
+	logFile, err := logging.CreateLogFile("monitor.log")
 	if err != nil {
-		log.Printf("Failed to create log file, using default logger")
+		log.Printf("Failed to open log file: %v, falling back to stdout", err)
 		return nil
 	}
 
 	logger := log.New(logging.CreateMultiWriter(logFile), "[MONITOR] ", log.LstdFlags)
-
 	logger.Printf("[INIT] Initializing monitoring service...")
-	logger.Printf("[CONFIG] RPC Endpoint=%s, USDC Threshold=%.2f",
-		cfg.SolanaRPCEndpoint, cfg.USDCThreshold)
+	logger.Printf("[CONFIG] RPC Endpoint=%s", config.SolanaRPCEndpoint)
 
-	// Create default USDC threshold rule
-	usdcRule := NewUSDCThresholdRule(cfg.USDCThreshold)
+	threshold := 1000.0
+	if thresholdStr := os.Getenv("USDC_THRESHOLD"); thresholdStr != "" {
+		if val, err := strconv.ParseFloat(thresholdStr, 64); err == nil {
+			threshold = val
+		}
+	}
+	logger.Printf("[CONFIG] USDC Threshold=%.2f", threshold)
 
 	return &Service{
 		solanaClient: solanaClient,
-		config:       cfg,
+		config:       config,
 		addresses:    make(map[int64][]string),
 		monitors:     make(map[int64]context.CancelFunc),
+		rules:        []Rule{NewUSDCThresholdRule(threshold)},
 		logger:       logger,
-		rules:        []Rule{usdcRule},
 	}
 }
 
-// SetBot sets the Telegram bot for the service
 func (s *Service) SetBot(bot TelegramBotInterface) {
 	s.bot = bot
 	s.logger.Printf("[SUCCESS] Telegram bot configured and ready")
 }
 
-// Start starts the monitoring service
 func (s *Service) Start(ctx context.Context) error {
 	s.logger.Printf("[STARTUP] Starting monitoring service...")
 
-	// Log current state
 	s.mu.RLock()
 	if len(s.addresses) == 0 {
 		s.logger.Printf("[INFO] No addresses currently being monitored")
@@ -82,12 +79,10 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.mu.RUnlock()
 
-	// Wait for context cancellation
 	<-ctx.Done()
 
 	s.logger.Printf("[SHUTDOWN] Shutting down monitoring service...")
 
-	// Cancel all monitors
 	s.mu.Lock()
 	for chatID, cancel := range s.monitors {
 		s.logger.Printf("[SHUTDOWN] Stopping monitor for chat %d", chatID)
@@ -99,20 +94,17 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// AddAddress adds an address to monitor for a specific chat ID
 func (s *Service) AddAddress(chatID int64, address string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.logger.Printf("[ADD] Adding address %s for chat %d", address, chatID)
 
-	// Initialize address list if it doesn't exist
 	if _, exists := s.addresses[chatID]; !exists {
 		s.logger.Printf("[INIT] Initializing address list for chat %d", chatID)
 		s.addresses[chatID] = make([]string, 0)
 	}
 
-	// Add address if it's not already being monitored
 	found := false
 	for _, addr := range s.addresses[chatID] {
 		if addr == address {
@@ -126,13 +118,11 @@ func (s *Service) AddAddress(chatID int64, address string) {
 		s.addresses[chatID] = append(s.addresses[chatID], address)
 		s.logger.Printf("[SUCCESS] Added new address %s for chat %d", address, chatID)
 
-		// Cancel existing monitor if any
 		if cancel, exists := s.monitors[chatID]; exists {
 			s.logger.Printf("[SHUTDOWN] Cancelling existing monitor for chat %d", chatID)
 			cancel()
 		}
 
-		// Start new monitor for the updated address list
 		ctx, cancel := context.WithCancel(context.Background())
 		s.monitors[chatID] = cancel
 		s.logger.Printf("[STARTUP] Starting new monitor for chat %d with addresses: %v", chatID, s.addresses[chatID])
@@ -140,11 +130,18 @@ func (s *Service) AddAddress(chatID int64, address string) {
 	}
 }
 
-// monitorAddresses monitors transactions for a specific chat ID
 func (s *Service) monitorAddresses(ctx context.Context, chatID int64, addresses []string) {
 	s.logger.Printf("Starting transaction monitoring for chat %d, addresses: %v", chatID, addresses)
 
-	txChan, err := s.solanaClient.MonitorTransactions(ctx, addresses, s.config.USDCThreshold)
+	var threshold float64 = 1000.0 // default value
+	for _, rule := range s.rules {
+		if usdcRule, ok := rule.(*USDCThresholdRule); ok {
+			threshold = usdcRule.threshold
+			break
+		}
+	}
+
+	txChan, err := s.solanaClient.MonitorTransactions(ctx, addresses, threshold)
 	if err != nil {
 		s.logger.Printf("Failed to start monitoring for chat %d: %v", chatID, err)
 		return
@@ -168,7 +165,6 @@ func (s *Service) monitorAddresses(ctx context.Context, chatID int64, addresses 
 			s.logger.Printf("Processing transaction for chat %d: %s (%.2f USDC)",
 				chatID, tx.Signature, tx.USDCAmount)
 
-			// Apply each rule to the transaction
 			for _, rule := range s.rules {
 				if rule.Apply(&tx) {
 					message := rule.BuildMessage(&tx)
@@ -184,7 +180,6 @@ func (s *Service) monitorAddresses(ctx context.Context, chatID int64, addresses 
 	}
 }
 
-// RemoveAddress removes an address from monitoring for a specific chat ID
 func (s *Service) RemoveAddress(chatID int64, address string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -201,13 +196,11 @@ func (s *Service) RemoveAddress(chatID int64, address string) {
 		s.addresses[chatID] = newAddrs
 		s.logger.Printf("Updated address list for chat %d: %v", chatID, newAddrs)
 
-		// Cancel existing monitor
 		if cancel, exists := s.monitors[chatID]; exists {
 			s.logger.Printf("Cancelling existing monitor for chat %d", chatID)
 			cancel()
 		}
 
-		// Start new monitor if there are still addresses to monitor
 		if len(newAddrs) > 0 {
 			ctx, cancel := context.WithCancel(context.Background())
 			s.monitors[chatID] = cancel
@@ -219,7 +212,6 @@ func (s *Service) RemoveAddress(chatID int64, address string) {
 	}
 }
 
-// GetMonitoredAddresses returns the list of monitored addresses for a specific chat ID
 func (s *Service) GetMonitoredAddresses(chatID int64) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -231,4 +223,23 @@ func (s *Service) GetMonitoredAddresses(chatID int64) []string {
 
 	s.logger.Printf("No monitored addresses found for chat %d", chatID)
 	return nil
+}
+
+// ClearAddresses removes all monitored addresses for a given chat ID
+func (s *Service) ClearAddresses(chatID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logger.Printf("Clearing all addresses for chat %d", chatID)
+
+	// Cancel existing monitor if it exists
+	if cancel, exists := s.monitors[chatID]; exists {
+		s.logger.Printf("Cancelling monitor for chat %d", chatID)
+		cancel()
+		delete(s.monitors, chatID)
+	}
+
+	// Remove all addresses
+	delete(s.addresses, chatID)
+	s.logger.Printf("Successfully cleared all addresses for chat %d", chatID)
 }

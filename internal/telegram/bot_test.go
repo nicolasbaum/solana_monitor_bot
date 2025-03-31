@@ -5,11 +5,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"solana-monitor/internal/config"
 )
@@ -26,7 +29,7 @@ func (m *MockBotAPI) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 
 func (m *MockBotAPI) GetUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
 	args := m.Called(config)
-	return args.Get(0).(tgbotapi.UpdatesChannel)
+	return args.Get(0).(chan tgbotapi.Update)
 }
 
 func TestNewBot(t *testing.T) {
@@ -34,7 +37,6 @@ func TestNewBot(t *testing.T) {
 	cfg := &config.Config{
 		TelegramToken:     "test-token",
 		SolanaRPCEndpoint: "https://test-endpoint.com",
-		USDCThreshold:     1000.0,
 	}
 
 	// Create mock API
@@ -45,12 +47,13 @@ func TestNewBot(t *testing.T) {
 		return mockAPI, nil
 	}
 
-	// Create mock address handler and getter
+	// Create mock handlers
 	addressHandler := func(chatID int64, address string) {}
 	getAddresses := func(chatID int64) []string { return nil }
+	clearAddresses := func(chatID int64) {}
 
 	// Create bot with mock factory
-	bot, err := NewBotWithFactory("test-token", addressHandler, getAddresses, mockFactory, cfg)
+	bot, err := NewBotWithFactory("test-token", addressHandler, getAddresses, clearAddresses, mockFactory, cfg)
 
 	// Assert results
 	assert.NoError(t, err)
@@ -63,7 +66,6 @@ func TestSendAlert(t *testing.T) {
 	cfg := &config.Config{
 		TelegramToken:     "test-token",
 		SolanaRPCEndpoint: "https://test-endpoint.com",
-		USDCThreshold:     1000.0,
 	}
 
 	// Create mock bot API
@@ -97,6 +99,106 @@ func TestSendAlert(t *testing.T) {
 	// Assert results
 	assert.NoError(t, err)
 	mockAPI.AssertExpectations(t)
+}
+
+func TestClearCommand(t *testing.T) {
+	// Create mocks
+	mockAPI := &MockBotAPI{}
+	mockAddressHandler := func(chatID int64, address string) {}
+	mockGetAddresses := func(chatID int64) []string {
+		return []string{"addr1", "addr2"}
+	}
+	clearCalled := false
+	mockClearAddresses := func(chatID int64) {
+		clearCalled = true
+	}
+
+	// Create bot
+	bot, err := NewBotWithFactory(
+		"test-token",
+		mockAddressHandler,
+		mockGetAddresses,
+		mockClearAddresses,
+		func(token string) (BotAPIInterface, error) {
+			return mockAPI, nil
+		},
+		&config.Config{},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, bot)
+
+	// Set up update channel
+	updates := make(chan tgbotapi.Update, 1)
+	mockAPI.On("GetUpdatesChan", mock.Anything).Return(updates)
+
+	// Test clear command with addresses
+	chatID := int64(12345)
+	mockAPI.On("Send", mock.MatchedBy(func(msg tgbotapi.MessageConfig) bool {
+		return msg.ChatID == chatID && strings.Contains(msg.Text, "[Success] All monitored addresses have been removed")
+	})).Return(tgbotapi.Message{}, nil).Once()
+
+	// Start bot in background
+	go bot.Start()
+
+	// Send clear command
+	updates <- tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{
+				ID: chatID,
+			},
+			Text: "/clear",
+			Entities: []tgbotapi.MessageEntity{
+				{
+					Type:   "bot_command",
+					Offset: 0,
+					Length: 6,
+				},
+			},
+		},
+	}
+
+	// Allow time for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify expectations
+	mockAPI.AssertExpectations(t)
+	require.True(t, clearCalled, "clearAddresses should have been called")
+
+	// Test clear command with no addresses
+	mockGetAddresses = func(chatID int64) []string {
+		return nil
+	}
+	bot.getAddresses = mockGetAddresses
+
+	mockAPI.On("Send", mock.MatchedBy(func(msg tgbotapi.MessageConfig) bool {
+		return msg.ChatID == chatID && strings.Contains(msg.Text, "[Info] You are not monitoring any addresses")
+	})).Return(tgbotapi.Message{}, nil).Once()
+
+	// Send clear command again
+	updates <- tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{
+				ID: chatID,
+			},
+			Text: "/clear",
+			Entities: []tgbotapi.MessageEntity{
+				{
+					Type:   "bot_command",
+					Offset: 0,
+					Length: 6,
+				},
+			},
+		},
+	}
+
+	// Allow time for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify expectations
+	mockAPI.AssertExpectations(t)
+
+	// Close update channel
+	close(updates)
 }
 
 // NewTestLogger creates a logger for testing

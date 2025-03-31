@@ -19,7 +19,6 @@ func TestLoad(t *testing.T) {
 			expectedConfig: &Config{
 				SolanaRPCEndpoint: "https://api.mainnet-beta.solana.com",
 				TelegramToken:     "",
-				USDCThreshold:     1000.0,
 			},
 		},
 		{
@@ -27,23 +26,10 @@ func TestLoad(t *testing.T) {
 			envVars: map[string]string{
 				"SOLANA_RPC_ENDPOINT": "https://custom-endpoint.com",
 				"TELEGRAM_BOT_TOKEN":  "test-token",
-				"USDC_THRESHOLD":      "2500.5",
 			},
 			expectedConfig: &Config{
 				SolanaRPCEndpoint: "https://custom-endpoint.com",
 				TelegramToken:     "test-token",
-				USDCThreshold:     2500.5,
-			},
-		},
-		{
-			name: "Invalid USDC threshold falls back to default",
-			envVars: map[string]string{
-				"USDC_THRESHOLD": "invalid",
-			},
-			expectedConfig: &Config{
-				SolanaRPCEndpoint: "https://api.mainnet-beta.solana.com",
-				TelegramToken:     "",
-				USDCThreshold:     1000.0,
 			},
 		},
 	}
@@ -65,7 +51,6 @@ func TestLoad(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expectedConfig.SolanaRPCEndpoint, config.SolanaRPCEndpoint)
 			assert.Equal(t, tt.expectedConfig.TelegramToken, config.TelegramToken)
-			assert.Equal(t, tt.expectedConfig.USDCThreshold, config.USDCThreshold)
 		})
 	}
 }

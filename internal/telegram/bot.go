@@ -3,6 +3,8 @@ package telegram
 import (
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 
 	"solana-monitor/internal/config"
@@ -30,24 +32,25 @@ type Bot struct {
 	api            BotAPIInterface
 	addressHandler func(chatID int64, address string)
 	getAddresses   func(chatID int64) []string
+	clearAddresses func(chatID int64)
 	logger         *log.Logger
 	config         *config.Config
 }
 
 // NewBot creates a new Telegram bot instance
-func NewBot(token string, addressHandler func(chatID int64, address string), getAddresses func(chatID int64) []string, config *config.Config) (*Bot, error) {
-	return NewBotWithFactory(token, addressHandler, getAddresses, DefaultBotAPIFactory, config)
+func NewBot(token string, addressHandler func(chatID int64, address string), getAddresses func(chatID int64) []string, clearAddresses func(chatID int64), config *config.Config) (*Bot, error) {
+	return NewBotWithFactory(token, addressHandler, getAddresses, clearAddresses, DefaultBotAPIFactory, config)
 }
 
 // NewBotWithFactory creates a new Telegram bot instance using a custom BotAPI factory
-func NewBotWithFactory(token string, addressHandler func(chatID int64, address string), getAddresses func(chatID int64) []string, factory BotAPIFactory, config *config.Config) (*Bot, error) {
+func NewBotWithFactory(token string, addressHandler func(chatID int64, address string), getAddresses func(chatID int64) []string, clearAddresses func(chatID int64), factory BotAPIFactory, config *config.Config) (*Bot, error) {
 	api, err := factory(token)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot: %v", err)
 	}
 
 	// Create a logger that writes to a file with timestamp
-	logFile, err := logging.CreateLogFile("telegram_bot.log")
+	logFile, err := logging.CreateLogFile("telegram.log")
 	if err != nil {
 		log.Printf("Failed to open log file: %v, falling back to stdout", err)
 		return nil, fmt.Errorf("failed to create log file: %v", err)
@@ -60,9 +63,21 @@ func NewBotWithFactory(token string, addressHandler func(chatID int64, address s
 		api:            api,
 		addressHandler: addressHandler,
 		getAddresses:   getAddresses,
+		clearAddresses: clearAddresses,
 		logger:         logger,
 		config:         config,
 	}, nil
+}
+
+// getUSDCThreshold gets the USDC threshold from environment or returns default
+func getUSDCThreshold() float64 {
+	threshold := 1000.0 // Default threshold
+	if thresholdStr := os.Getenv("USDC_THRESHOLD"); thresholdStr != "" {
+		if val, err := strconv.ParseFloat(thresholdStr, 64); err == nil {
+			threshold = val
+		}
+	}
+	return threshold
 }
 
 // SendAlert sends a transaction alert to the specified chat ID
@@ -113,6 +128,7 @@ func (b *Bot) Start() {
 						"/start - Start monitoring\n"+
 						"/watch <address> - Add a Solana address to monitor\n"+
 						"/list - List currently monitored addresses\n"+
+						"/clear - Remove all monitored addresses\n"+
 						"/help - Show this help message\n\n"+
 						"Example:\n"+
 						"/watch FMvbLJC5bZtik6WqMz7kzQYzJXEqyWHkQzpqGxgMozS2")
@@ -138,7 +154,7 @@ func (b *Bot) Start() {
 
 				msg := tgbotapi.NewMessage(chatID,
 					fmt.Sprintf("[Success] Now monitoring address:\n%s\n\n"+
-						"You'll receive alerts for USDC transfers exceeding %.2f USDC.", address, b.config.USDCThreshold))
+						"You'll receive alerts for USDC transfers exceeding %.2f USDC.", address, getUSDCThreshold()))
 				b.api.Send(msg)
 
 			case "list":
@@ -158,6 +174,18 @@ func (b *Bot) Start() {
 
 				msg := tgbotapi.NewMessage(chatID, message)
 				msg.ParseMode = "Markdown" // Enable markdown for code formatting
+				b.api.Send(msg)
+
+			case "clear":
+				addresses := b.getAddresses(chatID)
+				if len(addresses) == 0 {
+					msg := tgbotapi.NewMessage(chatID, "[Info] You are not monitoring any addresses.")
+					b.api.Send(msg)
+					continue
+				}
+
+				b.clearAddresses(chatID)
+				msg := tgbotapi.NewMessage(chatID, "[Success] All monitored addresses have been removed.")
 				b.api.Send(msg)
 			}
 		}

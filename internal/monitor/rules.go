@@ -26,7 +26,6 @@ func NewUSDCThresholdRule(threshold float64) *USDCThresholdRule {
 	}
 }
 
-// Apply checks if the USDC transfer amount exceeds the threshold
 func (r *USDCThresholdRule) Apply(tx *solana.Transaction) bool {
 	return tx.USDCAmount >= r.threshold
 }

@@ -43,13 +43,11 @@ var (
 	logDir = "logs" // Default log directory
 )
 
-// Logger wraps the standard logger with additional functionality
 type Logger struct {
 	level LogLevel
 	file  *os.File
 }
 
-// SetEnvFile sets the path to the environment file
 func SetEnvFile(path string) {
 	envMutex.Lock()
 	defer envMutex.Unlock()
@@ -95,37 +93,31 @@ func GetLogger() *Logger {
 	return instance
 }
 
-// Error logs an error message
 func (l *Logger) Error(format string, args ...interface{}) {
 	l.log(LogLevelError, format, args...)
 }
 
-// Info logs an info message if log level is Info or Debug
 func (l *Logger) Info(format string, args ...interface{}) {
 	if l.level >= LogLevelInfo {
 		l.log(LogLevelInfo, format, args...)
 	}
 }
 
-// Debug logs a debug message if log level is Debug
 func (l *Logger) Debug(format string, args ...interface{}) {
 	if l.level >= LogLevelDebug {
 		l.log(LogLevelDebug, format, args...)
 	}
 }
 
-// SetLogLevel sets the logging level
 func (l *Logger) SetLogLevel(level LogLevel) {
 	l.level = level
 	l.Info("Log level changed to: %s", FormatLogLevel(level))
 }
 
-// GetLogLevel returns the current logging level
 func (l *Logger) GetLogLevel() LogLevel {
 	return l.level
 }
 
-// FormatLogLevel converts a LogLevel to its string representation
 func FormatLogLevel(level LogLevel) string {
 	switch level {
 	case LogLevelError:
@@ -171,7 +163,6 @@ func getLogLevelFromEnv() LogLevel {
 		}
 	}
 
-	// If file loading fails or level is not set, check environment variable directly
 	level := os.Getenv("LOG_LEVEL")
 	switch level {
 	case "ERROR":
@@ -185,7 +176,6 @@ func getLogLevelFromEnv() LogLevel {
 	}
 }
 
-// SetLogDirectory sets the directory where all logs will be stored
 func SetLogDirectory(dir string) {
 	logDir = dir
 	// Create the directory if it doesn't exist
@@ -194,17 +184,15 @@ func SetLogDirectory(dir string) {
 	}
 }
 
-// CreateLogFile creates a log file in the configured log directory
-func CreateLogFile(name string) (*os.File, error) {
-	// Ensure log directory exists
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create log directory: %v", err)
+func CreateLogFile(filename string) (*os.File, error) {
+	// Ensure logs directory exists
+	logsDir := "logs"
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %v", err)
 	}
 
-	// Create log file path
-	logPath := filepath.Join(logDir, name)
-
-	// Open log file
+	// Create log file in logs directory
+	logPath := filepath.Join(logsDir, filename)
 	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file %s: %v", logPath, err)
@@ -213,7 +201,6 @@ func CreateLogFile(name string) (*os.File, error) {
 	return file, nil
 }
 
-// CreateMultiWriter creates a writer that writes to both file and stdout
 func CreateMultiWriter(file *os.File) io.Writer {
-	return io.MultiWriter(os.Stdout, file)
+	return io.MultiWriter(file, os.Stdout)
 }
