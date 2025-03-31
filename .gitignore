@@ -11,9 +11,8 @@ logs/
 *.iws
 *.ipr
 
-
-/monitor
-/solana-monitor
+# Binary builds
+cmd/monitor/monitor
 
 # macOS specific
 .DS_Store
